@@ -1,6 +1,6 @@
 name: Build & Release Machine Code (Native Image)
 
-# 仅推送 v* 标签自动构建；也可在 Actions 页面手动测试（手动运行不发布 Release）。
+# 普通提交、PR 不触发。手动运行只测试和打包，不发布 Release。
 on:
   workflow_dispatch:
   push:
@@ -8,6 +8,9 @@ on:
 
 permissions:
   contents: read
+
+env:
+  MAIN_CLASS: org.hztech.core.plugin.license.common.util.NativeMachineCodeApp
 
 jobs:
   test:
@@ -20,15 +23,125 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
-      - name: Build and test JVM source
+      - name: Build and test
         run: mvn -B -ntp clean verify
-      - name: Verify JAR and shared native entrypoint
-        shell: bash
+      - name: Check JVM native entrypoint
         run: |
           java -jar target/hztech-machine-code.jar --help
-          java -cp target/hztech-machine-code.jar org.hztech.core.plugin.license.common.util.NativeMachineCodeApp --self-test
+          java -cp target/hztech-machine-code.jar "$MAIN_CLASS" --self-test
 
-  native:
+  linux-static:
+    name: Linux AMD64 (musl static)
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          distribution: graalvm-community
+          java-version: '21'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache: maven
+          native-image-musl: 'true'
+      - name: Build executable JAR
+        run: mvn -B -ntp -DskipTests clean package
+      - name: Compile fully static Native Image
+        shell: bash
+        run: |
+          set -euo pipefail
+          native-image --no-fallback --static --libc=musl -march=compatibility \
+            -cp target/hztech-machine-code.jar \
+            "$MAIN_CLASS" \
+            -o target/HzTechMachineCode
+      - name: Verify static binary and fixed SHA-256 fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          file target/HzTechMachineCode
+          if readelf -l target/HzTechMachineCode | grep -q INTERP; then
+            echo 'ERROR: ELF still contains a dynamic loader' >&2
+            exit 1
+          fi
+          jvm_key="$(java -cp target/hztech-machine-code.jar "$MAIN_CLASS" --self-test)"
+          native_key="$(target/HzTechMachineCode --self-test)"
+          test "$jvm_key" = "$native_key"
+          [[ "$native_key" =~ ^[0-9A-F]{64}$ ]]
+      - name: Archive
+        run: |
+          mkdir -p release
+          tar -czf release/hztech-machine-code-linux-amd64-static.tar.gz -C target HzTechMachineCode
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hztech-machine-code-linux-amd64-static
+          path: release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-glibc228:
+    name: Linux ${{ matrix.arch }} (glibc 2.28 baseline)
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Build executable JAR
+        run: mvn -B -ntp -DskipTests clean package
+      - name: Build native executable in Oracle Linux 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --platform "linux/${{ matrix.arch }}" \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            --entrypoint native-image \
+            ghcr.io/graalvm/native-image-community:21-ol8 \
+            --no-fallback -march=compatibility \
+            -cp target/hztech-machine-code.jar \
+            "$MAIN_CLASS" \
+            -o target/HzTechMachineCode
+      - name: Check GLIBC ceiling and fixed SHA-256 fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          file target/HzTechMachineCode
+          max_glibc="$(readelf -V target/HzTechMachineCode | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -n 1)"
+          echo "Highest referenced GLIBC symbol: $max_glibc"
+          python3 - "$max_glibc" <<'PY'
+          import sys
+          version = tuple(map(int, sys.argv[1].split('_', 1)[1].split('.')))
+          if version > (2, 28):
+              raise SystemExit(f'GLIBC {version} exceeds compatibility ceiling 2.28')
+          PY
+          jvm_key="$(java -cp target/hztech-machine-code.jar "$MAIN_CLASS" --self-test)"
+          native_key="$(target/HzTechMachineCode --self-test)"
+          test "$jvm_key" = "$native_key"
+          [[ "$native_key" =~ ^[0-9A-F]{64}$ ]]
+      - name: Archive
+        shell: bash
+        run: |
+          mkdir -p release
+          tar -czf "release/hztech-machine-code-linux-${{ matrix.arch }}-glibc228.tar.gz" -C target HzTechMachineCode
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hztech-machine-code-linux-${{ matrix.arch }}-glibc228
+          path: release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  native-desktop:
     name: Native Image / ${{ matrix.name }}
     needs: test
     runs-on: ${{ matrix.runner }}
@@ -36,10 +149,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: linux-amd64
-            runner: ubuntu-24.04
-          - name: linux-arm64
-            runner: ubuntu-24.04-arm
           - name: windows-amd64
             runner: windows-2025
           - name: macos-arm64
@@ -52,36 +161,33 @@ jobs:
           java-version: '21'
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache: maven
-          native-image-job-reports: 'true'
-      - name: Show toolchain
-        shell: pwsh
-        run: |
-          java -version
-          native-image --version
-          mvn -version
-      - name: Build GraalVM Native Image
-        run: mvn -B -ntp -DskipTests -Pnative clean package
-      - name: Check native hash against Java hash (fixed fixture)
+      - name: Build executable JAR
+        run: mvn -B -ntp -DskipTests clean package
+      - name: Compile Native Image
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $main = 'org.hztech.core.plugin.license.common.util.NativeMachineCodeApp'
-          $jvmKey = (& java -cp 'target/hztech-machine-code.jar' $main --self-test | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0) { throw 'JVM fixture failed' }
+          $exe = if ($IsWindows) { 'target/HzTechMachineCode.exe' } else { 'target/HzTechMachineCode' }
+          & native-image --no-fallback -march=compatibility -cp 'target/hztech-machine-code.jar' $env:MAIN_CLASS -o $exe
+          if ($LASTEXITCODE -ne 0) { throw "native-image exited with $LASTEXITCODE" }
+      - name: Compare JVM and native fixed fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $jvmKey = (& java -cp 'target/hztech-machine-code.jar' $env:MAIN_CLASS --self-test | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'JVM self-test failed' }
           $exe = if ($IsWindows) { 'target/HzTechMachineCode.exe' } else { 'target/HzTechMachineCode' }
           $nativeKey = (& (Join-Path (Get-Location) $exe) --self-test | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0) { throw 'Native fixture failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'Native self-test failed' }
           if ($jvmKey -cne $nativeKey -or $nativeKey -notmatch '^[0-9A-F]{64}$') {
-            throw "Native and JVM output differ: JVM=$jvmKey NATIVE=$nativeKey"
+            throw "JVM/Native mismatch: $jvmKey / $nativeKey"
           }
-          Write-Output "Native SHA-256 fixture matches JVM: $nativeKey"
-      - name: Archive native executable
+      - name: Archive
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path release | Out-Null
           if ($IsWindows) {
-            Compress-Archive -Path 'target/HzTechMachineCode.exe' -DestinationPath 'release/hztech-machine-code-${{ matrix.name }}-native.zip' -CompressionLevel Optimal
+            Compress-Archive -Path 'target/HzTechMachineCode.exe' -DestinationPath 'release/hztech-machine-code-${{ matrix.name }}-native.zip'
           } else {
             tar -czf 'release/hztech-machine-code-${{ matrix.name }}-native.tar.gz' -C target HzTechMachineCode
             if ($LASTEXITCODE -ne 0) { throw 'tar failed' }
@@ -94,17 +200,15 @@ jobs:
           retention-days: 14
 
   fallback:
-    name: Bundled-JRE GUI fallback / ${{ matrix.name }}
+    name: Bundled-JRE GUI / ${{ matrix.name }}
     needs: test
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # GraalVM 21 没有可直接使用的 Windows arm64 Native Image 构建发行版。
           - name: windows-arm64
             runner: windows-11-arm
-          # Oracle GraalVM 21 后期维护版本已经移除 macOS Intel x64 支持。
           - name: macos-amd64
             runner: macos-15-intel
     steps:
@@ -114,18 +218,19 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
-      - name: Build GUI executable JAR
+      - name: Build executable JAR
         run: mvn -B -ntp -DskipTests clean package
-      - name: Build jpackage app-image fallback
+      - name: Build self-contained app-image
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path packaging-input, build, release | Out-Null
           Copy-Item 'target/hztech-machine-code.jar' 'packaging-input/hztech-machine-code.jar'
-          $args = @(
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME -replace '^v', '' } else { '1.0.0' }
+          $pkgArgs = @(
             '--type', 'app-image',
             '--name', 'HzTechMachineCode',
-            '--app-version', '1.0.0',
+            '--app-version', $version,
             '--input', 'packaging-input',
             '--main-jar', 'hztech-machine-code.jar',
             '--main-class', 'org.hztech.core.plugin.license.common.util.MachineCodeApp',
@@ -138,15 +243,15 @@ jobs:
           arguments=--cli
           win-console=true
           '@ | Set-Content -Path 'cli-launcher.properties' -Encoding utf8
-            $args += @('--add-launcher', 'HzTechMachineCodeCLI=cli-launcher.properties')
+            $pkgArgs += @('--add-launcher', 'HzTechMachineCodeCLI=cli-launcher.properties')
           }
           if ($IsMacOS) {
-            $args += @('--mac-package-identifier', 'org.hztech.machinecode')
+            $pkgArgs += @('--mac-package-identifier', 'org.hztech.machinecode')
           }
-          & jpackage @args
-          if ($LASTEXITCODE -ne 0) { throw 'jpackage failed' }
+          & jpackage @pkgArgs
+          if ($LASTEXITCODE -ne 0) { throw "jpackage exited with $LASTEXITCODE" }
           if ($IsWindows) {
-            Compress-Archive -Path 'build/HzTechMachineCode' -DestinationPath 'release/hztech-machine-code-${{ matrix.name }}-jpackage.zip' -CompressionLevel Optimal
+            Compress-Archive -Path 'build/HzTechMachineCode' -DestinationPath 'release/hztech-machine-code-${{ matrix.name }}-jpackage.zip'
           } else {
             tar -czf 'release/hztech-machine-code-${{ matrix.name }}-jpackage.tar.gz' -C build HzTechMachineCode.app
             if ($LASTEXITCODE -ne 0) { throw 'tar failed' }
@@ -160,8 +265,8 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [native, fallback]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-static, linux-glibc228, native-desktop, fallback]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
