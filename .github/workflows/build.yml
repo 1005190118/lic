@@ -167,31 +167,67 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $exe = if ($IsWindows) { 'target/HzTechMachineCode.exe' } else { 'target/HzTechMachineCode' }
-          & native-image --no-fallback -march=compatibility -cp 'target/hztech-machine-code.jar' $env:MAIN_CLASS -o $exe
-          if ($LASTEXITCODE -ne 0) { throw "native-image exited with $LASTEXITCODE" }
+          New-Item -ItemType Directory -Force -Path target | Out-Null
+
+          # GraalVM 先输出到工作目录，避免 -o 使用含路径的文件名
+          & native-image --no-fallback -march=compatibility `
+            -cp 'target/hztech-machine-code.jar' `
+            $env:MAIN_CLASS -o HzTechMachineCode
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "native-image exited with $LASTEXITCODE"
+          }
+
+          $binaryName = if ($IsWindows) { 'HzTechMachineCode.exe' } else { 'HzTechMachineCode' }
+          $src = Join-Path (Get-Location) $binaryName
+          $dst = Join-Path 'target' $binaryName
+
+          Write-Host 'Files after native-image:'
+          Get-ChildItem -File | Select-Object Name, Length, FullName
+          if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+            throw "Native executable not found at $src"
+          }
+          Move-Item -LiteralPath $src -Destination $dst -Force
+          if (-not (Test-Path -LiteralPath $dst -PathType Leaf)) {
+            throw "Native executable was not moved to $dst"
+          }
+
       - name: Compare JVM and native fixed fixture
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $jvmKey = (& java -cp 'target/hztech-machine-code.jar' $env:MAIN_CLASS --self-test | Out-String).Trim()
           if ($LASTEXITCODE -ne 0) { throw 'JVM self-test failed' }
-          $exe = if ($IsWindows) { 'target/HzTechMachineCode.exe' } else { 'target/HzTechMachineCode' }
-          $nativeKey = (& (Join-Path (Get-Location) $exe) --self-test | Out-String).Trim()
+
+          $binaryName = if ($IsWindows) { 'HzTechMachineCode.exe' } else { 'HzTechMachineCode' }
+          $binaryPath = (Resolve-Path -LiteralPath (Join-Path 'target' $binaryName) -ErrorAction Stop).Path
+          $nativeKey = (& $binaryPath --self-test | Out-String).Trim()
           if ($LASTEXITCODE -ne 0) { throw 'Native self-test failed' }
           if ($jvmKey -cne $nativeKey -or $nativeKey -notmatch '^[0-9A-F]{64}$') {
             throw "JVM/Native mismatch: $jvmKey / $nativeKey"
           }
+
       - name: Archive
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path release | Out-Null
+
           if ($IsWindows) {
-            Compress-Archive -Path 'target/HzTechMachineCode.exe' -DestinationPath 'release/hztech-machine-code-${{ matrix.name }}-native.zip'
+            $binaryPath = (Resolve-Path -LiteralPath 'target/HzTechMachineCode.exe' -ErrorAction Stop).Path
+            Compress-Archive -LiteralPath $binaryPath `
+              -DestinationPath 'release/hztech-machine-code-${{ matrix.name }}-native.zip' `
+              -CompressionLevel Optimal -Force
           } else {
-            tar -czf 'release/hztech-machine-code-${{ matrix.name }}-native.tar.gz' -C target HzTechMachineCode
+            $binaryPath = 'target/HzTechMachineCode'
+            if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
+              throw "Native executable not found: $binaryPath"
+            }
+            tar -czf 'release/hztech-machine-code-${{ matrix.name }}-native.tar.gz' `
+              -C target HzTechMachineCode
             if ($LASTEXITCODE -ne 0) { throw 'tar failed' }
           }
+          Get-ChildItem release -File | Select-Object Name, Length
       - uses: actions/upload-artifact@v4
         with:
           name: hztech-machine-code-${{ matrix.name }}-native
@@ -226,16 +262,34 @@ jobs:
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path packaging-input, build, release | Out-Null
           Copy-Item 'target/hztech-machine-code.jar' 'packaging-input/hztech-machine-code.jar'
-          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME -replace '^v', '' } else { '1.0.0' }
+
+          # 版本号来自 v1.2.3；手动构建使用 1.0.0
+          $version = '1.0.0'
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            if ($env:GITHUB_REF_NAME -notmatch '^v(\d+\.\d+\.\d+)$') {
+              throw "For jpackage, use tags like v1.0.3; got $env:GITHUB_REF_NAME"
+            }
+            $version = $Matches[1]
+          }
+
+          Write-Host "Package version: $version"
+          Write-Host "Java version:"
+          & java -version
+          Write-Host "jpackage version:"
+          & jpackage --version
+
           $pkgArgs = @(
             '--type', 'app-image',
             '--name', 'HzTechMachineCode',
             '--app-version', $version,
+            '--description', 'HzTech Offline License Machine Code Generator',
             '--input', 'packaging-input',
             '--main-jar', 'hztech-machine-code.jar',
             '--main-class', 'org.hztech.core.plugin.license.common.util.MachineCodeApp',
-            '--dest', 'build'
+            '--dest', 'build',
+            '--verbose'
           )
+
           if ($IsWindows) {
             @'
           main-jar=hztech-machine-code.jar
@@ -246,16 +300,30 @@ jobs:
             $pkgArgs += @('--add-launcher', 'HzTechMachineCodeCLI=cli-launcher.properties')
           }
           if ($IsMacOS) {
-            $pkgArgs += @('--mac-package-identifier', 'org.hztech.machinecode')
+            $pkgArgs += @('--mac-package-identifier', 'org.hztech.machinecode', '--mac-package-name', 'HzTech Code')
           }
+
           & jpackage @pkgArgs
-          if ($LASTEXITCODE -ne 0) { throw "jpackage exited with $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "jpackage exited with $LASTEXITCODE; inspect verbose logs above" }
+
+          Write-Host 'Packaging output:'
+          Get-ChildItem -Path build -Force | Select-Object Name, FullName
+
           if ($IsWindows) {
-            Compress-Archive -Path 'build/HzTechMachineCode' -DestinationPath 'release/hztech-machine-code-${{ matrix.name }}-jpackage.zip'
+            if (-not (Test-Path -LiteralPath 'build/HzTechMachineCode' -PathType Container)) {
+              throw 'Windows jpackage app-image directory not found'
+            }
+            Compress-Archive -LiteralPath (Resolve-Path -LiteralPath 'build/HzTechMachineCode').Path `
+              -DestinationPath 'release/hztech-machine-code-${{ matrix.name }}-jpackage.zip' -Force
           } else {
+            $appPath = 'build/HzTechMachineCode.app'
+            if (-not (Test-Path -LiteralPath $appPath -PathType Container)) {
+              throw "macOS jpackage application not found at $appPath"
+            }
             tar -czf 'release/hztech-machine-code-${{ matrix.name }}-jpackage.tar.gz' -C build HzTechMachineCode.app
             if ($LASTEXITCODE -ne 0) { throw 'tar failed' }
           }
+          Get-ChildItem release -File | Select-Object Name, Length
       - uses: actions/upload-artifact@v4
         with:
           name: hztech-machine-code-${{ matrix.name }}-jpackage
