@@ -15,6 +15,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <oshi.version>7.7.3</oshi.version>
         <junit.version>5.11.4</junit.version>
+        <native.buildtools.version>0.11.5</native.buildtools.version>
     </properties>
 
     <dependencies>
@@ -82,4 +83,35 @@
             </plugin>
         </plugins>
     </build>
+    <profiles>
+        <!-- 编译原生 CLI。保留现有 OSHI + Swing JAR 供旧版 GUI 和 V1 兼容。 -->
+        <profile>
+            <id>native</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <version>${native.buildtools.version}</version>
+                        <executions>
+                            <execution>
+                                <id>build-native</id>
+                                <phase>package</phase>
+                                <goals><goal>compile-no-fork</goal></goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <mainClass>org.hztech.core.plugin.license.common.util.NativeMachineCodeApp</mainClass>
+                            <imageName>HzTechMachineCode</imageName>
+                            <fallback>false</fallback>
+                            <buildArgs>
+                                <buildArg>--no-fallback</buildArg>
+                                <buildArg>-O2</buildArg>
+                            </buildArgs>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

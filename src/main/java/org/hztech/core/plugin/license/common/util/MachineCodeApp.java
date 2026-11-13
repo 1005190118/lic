@@ -125,8 +125,7 @@ public final class MachineCodeApp {
                     try {
                         MachineKeyGenerator.Result result = get();
                         key.setText(result.machineKey());
-                        source.setText("算法 V" + result.version() + "  ·  标识来源：" + result.source().displayName()
-                                + "  ·  信息仅在本机计算");
+                        source.setText("算法 V" + result.version() + "  ·  信息仅在本机计算");
                         copy.setEnabled(true);
                     } catch (Exception e) {
                         key.setText("机器码生成失败");

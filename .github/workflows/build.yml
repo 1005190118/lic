@@ -1,5 +1,6 @@
-name: Build Machine Code (6 platforms)
+name: Build & Release Machine Code (Native Image)
 
+# 仅推送 v* 标签自动构建；也可在 Actions 页面手动测试（手动运行不发布 Release）。
 on:
   workflow_dispatch:
   push:
@@ -19,13 +20,16 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
-      - name: Build and test
+      - name: Build and test JVM source
         run: mvn -B -ntp clean verify
-      - name: Verify runnable JAR
-        run: java -jar target/hztech-machine-code.jar --help
+      - name: Verify JAR and shared native entrypoint
+        shell: bash
+        run: |
+          java -jar target/hztech-machine-code.jar --help
+          java -cp target/hztech-machine-code.jar org.hztech.core.plugin.license.common.util.NativeMachineCodeApp --self-test
 
-  package:
-    name: ${{ matrix.name }}
+  native:
+    name: Native Image / ${{ matrix.name }}
     needs: test
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -38,12 +42,71 @@ jobs:
             runner: ubuntu-24.04-arm
           - name: windows-amd64
             runner: windows-2025
-          - name: windows-arm64
-            runner: windows-11-arm
-          - name: macos-amd64
-            runner: macos-15-intel
           - name: macos-arm64
             runner: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          distribution: graalvm-community
+          java-version: '21'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache: maven
+          native-image-job-reports: 'true'
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          java -version
+          native-image --version
+          mvn -version
+      - name: Build GraalVM Native Image
+        run: mvn -B -ntp -DskipTests -Pnative clean package
+      - name: Check native hash against Java hash (fixed fixture)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $main = 'org.hztech.core.plugin.license.common.util.NativeMachineCodeApp'
+          $jvmKey = (& java -cp 'target/hztech-machine-code.jar' $main --self-test | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'JVM fixture failed' }
+          $exe = if ($IsWindows) { 'target/HzTechMachineCode.exe' } else { 'target/HzTechMachineCode' }
+          $nativeKey = (& (Join-Path (Get-Location) $exe) --self-test | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Native fixture failed' }
+          if ($jvmKey -cne $nativeKey -or $nativeKey -notmatch '^[0-9A-F]{64}$') {
+            throw "Native and JVM output differ: JVM=$jvmKey NATIVE=$nativeKey"
+          }
+          Write-Output "Native SHA-256 fixture matches JVM: $nativeKey"
+      - name: Archive native executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          if ($IsWindows) {
+            Compress-Archive -Path 'target/HzTechMachineCode.exe' -DestinationPath 'release/hztech-machine-code-${{ matrix.name }}-native.zip' -CompressionLevel Optimal
+          } else {
+            tar -czf 'release/hztech-machine-code-${{ matrix.name }}-native.tar.gz' -C target HzTechMachineCode
+            if ($LASTEXITCODE -ne 0) { throw 'tar failed' }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hztech-machine-code-${{ matrix.name }}-native
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  fallback:
+    name: Bundled-JRE GUI fallback / ${{ matrix.name }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GraalVM 21 没有可直接使用的 Windows arm64 Native Image 构建发行版。
+          - name: windows-arm64
+            runner: windows-11-arm
+          # Oracle GraalVM 21 后期维护版本已经移除 macOS Intel x64 支持。
+          - name: macos-amd64
+            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -51,74 +114,65 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
-      - name: Build executable JAR
+      - name: Build GUI executable JAR
         run: mvn -B -ntp -DskipTests clean package
-      - name: Create native application image and archive
+      - name: Build jpackage app-image fallback
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path packaging-input, build, release | Out-Null
-          Copy-Item target/hztech-machine-code.jar packaging-input/hztech-machine-code.jar
-
-          $pkgArgs = @(
+          Copy-Item 'target/hztech-machine-code.jar' 'packaging-input/hztech-machine-code.jar'
+          $args = @(
             '--type', 'app-image',
             '--name', 'HzTechMachineCode',
             '--app-version', '1.0.0',
-            '--description', 'HzTech Offline License Machine Code Generator',
             '--input', 'packaging-input',
             '--main-jar', 'hztech-machine-code.jar',
             '--main-class', 'org.hztech.core.plugin.license.common.util.MachineCodeApp',
             '--dest', 'build'
           )
-
           if ($IsWindows) {
-            # Windows GUI 主程序 + 额外的命令行 EXE（可输出到控制台）。
             @'
           main-jar=hztech-machine-code.jar
           main-class=org.hztech.core.plugin.license.common.util.MachineCodeApp
           arguments=--cli
           win-console=true
           '@ | Set-Content -Path 'cli-launcher.properties' -Encoding utf8
-            $pkgArgs += @('--add-launcher', 'HzTechMachineCodeCLI=cli-launcher.properties')
+            $args += @('--add-launcher', 'HzTechMachineCodeCLI=cli-launcher.properties')
           }
           if ($IsMacOS) {
-            $pkgArgs += @('--mac-package-identifier', 'org.hztech.machinecode')
+            $args += @('--mac-package-identifier', 'org.hztech.machinecode')
           }
-
-          & jpackage @pkgArgs
-          if ($LASTEXITCODE -ne 0) { throw "jpackage failed with exit code $LASTEXITCODE" }
-
+          & jpackage @args
+          if ($LASTEXITCODE -ne 0) { throw 'jpackage failed' }
           if ($IsWindows) {
-            Compress-Archive -Path 'build/HzTechMachineCode' -DestinationPath 'release/hztech-machine-code-${{ matrix.name }}.zip' -CompressionLevel Optimal
-          } elseif ($IsMacOS) {
-            tar -czf 'release/hztech-machine-code-${{ matrix.name }}.tar.gz' -C build HzTechMachineCode.app
+            Compress-Archive -Path 'build/HzTechMachineCode' -DestinationPath 'release/hztech-machine-code-${{ matrix.name }}-jpackage.zip' -CompressionLevel Optimal
           } else {
-            tar -czf 'release/hztech-machine-code-${{ matrix.name }}.tar.gz' -C build HzTechMachineCode
+            tar -czf 'release/hztech-machine-code-${{ matrix.name }}-jpackage.tar.gz' -C build HzTechMachineCode.app
+            if ($LASTEXITCODE -ne 0) { throw 'tar failed' }
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: hztech-machine-code-${{ matrix.name }}
+          name: hztech-machine-code-${{ matrix.name }}-jpackage
           path: release/*
           if-no-files-found: error
           retention-days: 14
 
   release:
     name: Publish GitHub Release
-    needs: package
+    needs: [native, fallback]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
-
     permissions:
       contents: write
-
     steps:
-      - name: Download all platform artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           pattern: hztech-machine-code-*
           path: release
           merge-multiple: true
-
+      - name: List release assets
+        run: ls -lah release/
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:

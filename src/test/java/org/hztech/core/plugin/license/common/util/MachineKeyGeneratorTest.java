@@ -40,4 +40,12 @@ class MachineKeyGeneratorTest {
         assertEquals(a, b);
         assertEquals(2, a.version());
     }
+    @Test
+    void v2KnownHashVectorMustNeverChangeSilently() {
+        var result = MachineKeyGenerator.generate(
+                "ABCD1234-1234-4567-8910-ABCDABCDABCD", "SYSTEM123", "BOARD123");
+        assertEquals("248CA17637812C7487BCEF91A7537F4B8B1D312E3DB48496B34358CEB849C7D8",
+                result.machineKey());
+    }
+
 }
