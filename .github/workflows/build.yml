@@ -1,0 +1,106 @@
+name: Build Machine Code (6 platforms)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Java unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Build and test
+        run: mvn -B -ntp clean verify
+      - name: Verify runnable JAR
+        run: java -jar target/hztech-machine-code.jar --help
+
+  package:
+    name: ${{ matrix.name }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-24.04
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+          - name: windows-amd64
+            runner: windows-2025
+          - name: windows-arm64
+            runner: windows-11-arm
+          - name: macos-amd64
+            runner: macos-15-intel
+          - name: macos-arm64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Build executable JAR
+        run: mvn -B -ntp -DskipTests clean package
+      - name: Create native application image and archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path packaging-input, build, release | Out-Null
+          Copy-Item target/hztech-machine-code.jar packaging-input/hztech-machine-code.jar
+
+          $pkgArgs = @(
+            '--type', 'app-image',
+            '--name', 'HzTechMachineCode',
+            '--app-version', '1.0.0',
+            '--description', 'HzTech Offline License Machine Code Generator',
+            '--input', 'packaging-input',
+            '--main-jar', 'hztech-machine-code.jar',
+            '--main-class', 'org.hztech.core.plugin.license.common.util.MachineCodeApp',
+            '--dest', 'build'
+          )
+
+          if ($IsWindows) {
+            # Windows GUI 主程序 + 额外的命令行 EXE（可输出到控制台）。
+            @'
+          main-jar=hztech-machine-code.jar
+          main-class=org.hztech.core.plugin.license.common.util.MachineCodeApp
+          arguments=--cli
+          win-console=true
+          '@ | Set-Content -Path 'cli-launcher.properties' -Encoding utf8
+            $pkgArgs += @('--add-launcher', 'HzTechMachineCodeCLI=cli-launcher.properties')
+          }
+          if ($IsMacOS) {
+            $pkgArgs += @('--mac-package-identifier', 'org.hztech.machinecode')
+          }
+
+          & jpackage @pkgArgs
+          if ($LASTEXITCODE -ne 0) { throw "jpackage failed with exit code $LASTEXITCODE" }
+
+          if ($IsWindows) {
+            Compress-Archive -Path 'build/HzTechMachineCode' -DestinationPath 'release/hztech-machine-code-${{ matrix.name }}.zip' -CompressionLevel Optimal
+          } elseif ($IsMacOS) {
+            tar -czf 'release/hztech-machine-code-${{ matrix.name }}.tar.gz' -C build HzTechMachineCode.app
+          } else {
+            tar -czf 'release/hztech-machine-code-${{ matrix.name }}.tar.gz' -C build HzTechMachineCode
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hztech-machine-code-${{ matrix.name }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14

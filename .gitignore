@@ -1,0 +1,20 @@
+# Maven / IDE
+/target/
+/build/
+/release/
+/.idea/
+*.iml
+.classpath
+.project
+.settings/
+
+# OS / secrets
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.*
+*.p12
+*.pfx
+*.jks
+*.key
